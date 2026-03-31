@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - '*'
+    branches:
+      - 'copilot/create-tag-*'
   workflow_dispatch:
     inputs:
       tag:
@@ -25,11 +27,29 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.release_tag }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: '0'
+
+      - name: Determine Release Tag
+        id: release_tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            RELEASE_TAG="${{ inputs.tag }}"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
+          elif [[ "$GITHUB_REF" == refs/heads/copilot/create-tag-* ]]; then
+            BRANCH_SUFFIX="${GITHUB_REF#refs/heads/copilot/create-tag-}"
+            RELEASE_TAG=$(echo "$BRANCH_SUFFIX" | tr '-' '.' | sed 's/^v//')
+          else
+            RELEASE_TAG="${{ github.ref_name }}"
+          fi
+          echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_ENV
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
 
       - name: Setup .NET
         uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5.2.0
@@ -38,11 +58,15 @@ jobs:
 
       - name: Update build.yaml
         run: |-
-          RELEASE_TAG="${{ inputs.tag || github.ref_name }}"
           echo "set version to ${RELEASE_TAG}"
           sed -i "s/version: .*/version: '${RELEASE_TAG}'/" ./src/build.yaml
           
-          COMMIT_RANGE=$(git describe --tags --abbrev=0 @^)..@
+          PREV_TAG=$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null || git describe --tags --abbrev=0 @^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            COMMIT_RANGE="${PREV_TAG}..${RELEASE_TAG}"
+          else
+            COMMIT_RANGE="${RELEASE_TAG}"
+          fi
           echo "generate changelog for commit range ${COMMIT_RANGE}"
           CHANGELOG=$(git log "$COMMIT_RANGE" --oneline --pretty=format:"- [%h] %s")
           sed -i 's/changelog: changelog/changelog: |-\n/' ./src/build.yaml
@@ -92,9 +116,11 @@ jobs:
         with:
           artifacts: ./*
           bodyFile: /tmp/changelog.md
+          tag: ${{ needs.build.outputs.release_tag }}
 
   publish:
     needs:
+      - build
       - upload
     runs-on: ubuntu-latest
     permissions: # Job-level permissions configuration starts here
@@ -118,11 +144,16 @@ jobs:
           python3 -m pip install jprm
           echo "::endgroup::"
           
-          RELEASE_TAG="${{ inputs.tag || github.ref_name }}"
+          RELEASE_TAG="${{ needs.build.outputs.release_tag }}"
           echo "set release tag to ${RELEASE_TAG}, get release info..."
           RELEASE_INFO=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG}")
           DOWNLOAD_URL=$(echo "$RELEASE_INFO" | jq -r '.assets[] | select(.name | test("\\.zip$")) | .browser_download_url')
           echo "download url: ${DOWNLOAD_URL}"
+          
+          if [ ! -f ./manifest.json ]; then
+            echo "manifest.json not found on main, initializing from source branch..."
+            git show origin/copilot/create-tag-v1-11-1-11:manifest.json > ./manifest.json 2>/dev/null || echo "[]" > ./manifest.json
+          fi
           
           echo "::group::Updating manifest.json"
           jprm repo add ./manifest.json "$(ls -d *.zip)" -u "${DOWNLOAD_URL}" -U "${DOWNLOAD_URL}"
@@ -132,7 +163,7 @@ jobs:
         run: |-
           git config --global user.name "${GITHUB_ACTOR}"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -a -m "Update manifest.json for release ${{ inputs.tag || github.ref_name }}"
+          git commit -a -m "Update manifest.json for release ${{ needs.build.outputs.release_tag }}"
 
       - name: Push changes
         uses: ad-m/github-push-action@77c5b412c50b723d2a4fbc6d71fb5723bcd439aa # v1.0.0
